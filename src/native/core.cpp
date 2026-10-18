@@ -122,6 +122,40 @@ double loss(const Vec& eta, const Vec& y, const Vec& b, const ModelOptions& o) {
         value += family_point(eta[i],y[i],o,i).objective;
     return value;
 }
+// Output-only normalized likelihood, excluding ridge. Scale defaults match wrappers.
+double display_loglik(const Vec& eta,const Vec& y,const ModelOptions& o,int64_t p,double dispersion) {
+    const double nan=std::numeric_limits<double>::quiet_NaN();
+    if(o.family==6 || o.family==7 || o.family==8 || o.family==12) return nan;
+    double kernel=0., pearson=0., constant=0.;
+    for(int64_t i=0;i<y.size();++i) {
+        const auto pt=family_point(eta[i],y[i],o,i);
+        kernel+=pt.objective;
+        if(o.family==4 || o.family==11) pearson+=std::pow((y[i]-pt.mu)/pt.mu,2);
+        if(o.family==1 || o.family==2 || o.family==3 || o.family==5 || o.family==13) {
+            if(y[i]!=std::floor(y[i])) return nan;
+        }
+        if(o.family==3) constant-=std::lgamma(y[i]+1.);
+        if(o.family==5) constant+=std::lgamma(y[i]+o.model.theta)-std::lgamma(o.model.theta)-std::lgamma(y[i]+1.)+o.model.theta*std::log(o.model.theta);
+        if(o.family==13) {
+            double n=trials_at(o,i);
+            if(n!=std::floor(n)) return nan;
+            constant+=std::lgamma(n+1.)-std::lgamma(y[i]+1.)-std::lgamma(n-y[i]+1.);
+        }
+    }
+    const double pi=std::acos(-1.);
+    if(o.family==0 || o.family==10) {
+        double scale=std::isnan(dispersion) ? 2.*kernel/y.size() : dispersion;
+        return scale==0. ? INFINITY : -.5*y.size()*std::log(2.*pi*scale)-kernel/scale;
+    }
+    if(o.family==4 || o.family==11) {
+        double scale=std::isnan(dispersion) ? (y.size()>p ? pearson/(y.size()-p) : nan) : dispersion;
+        if(!(scale>0.) || !std::isfinite(scale)) return nan;
+        double shape=1./scale;
+        return -kernel/scale+(shape-1.)*y.array().log().sum()-y.size()*(std::lgamma(shape)+shape*std::log(scale));
+    }
+    if(o.family==9) constant=y.size()*(std::lgamma((o.model.nu+1.)/2.)-std::lgamma(o.model.nu/2.)-.5*std::log(o.model.nu*pi)-std::log(o.model.sigma));
+    return constant-kernel;
+}
 void weights_into(const Vec& eta,const Vec& y,const ModelOptions& o,Vec& w) {
     SMM_SCOPE(7);
     for(Eigen::Index i=0;i<eta.size();++i) w[i]=family_point(eta[i],y[i],o,i).weight;
@@ -263,8 +297,10 @@ struct NoEigenAllocation {
 #endif
 struct PCGWorkspace {
     Vec r,z,p,Hp,Xp,weighted,coeff,projected;
-    PCGWorkspace(int64_t n, int64_t psize, int64_t rank)
-        : r(psize),z(psize),p(psize),Hp(psize),Xp(n),weighted(n),coeff(rank),projected(rank) {}
+    Vec mm_y,mm_old,mm_Xy,mm_Xold;
+    PCGWorkspace(int64_t n, int64_t psize, int64_t rank, bool mm=false)
+        : r(psize),z(psize),p(psize),Hp(psize),Xp(n),weighted(n),coeff(rank),projected(rank),
+          mm_y(mm ? psize : 0),mm_old(mm ? psize : 0),mm_Xy(mm ? n : 0),mm_Xold(mm ? n : 0) {}
 };
 void pcg(const Design& X, const Vec& w, const Vec& g, const Spectrum& s,
         const ModelOptions& o, int64_t rank, smm_info& info, bool& breakdown,
@@ -287,6 +323,48 @@ void pcg(const Design& X, const Vec& w, const Vec& g, const Spectrum& s,
     double rz=r.dot(z), initial=g.norm();
     breakdown=false;
     if (initial<=1e-10) return;
+    if (mm) {
+        // Match Julia's accelerated WLS MM: gradients are evaluated at the
+        // extrapolated point, but the accepted (non-extrapolated) step is returned.
+        // Inner momentum is independent of o.nesterov (outer acceleration).
+        ws.mm_y.setZero(); ws.mm_Xy.setZero();
+        double momentum=1.;
+        for (int64_t i=0;i<o.inner_maxiter;++i) {
+            if (!r.allFinite()) { breakdown=true; return; }
+            if (r.norm()<=std::max(1e-10,o.eta_max*initial)) return;
+            precondition_into();
+            if (!z.allFinite()) { breakdown=true; return; }
+            X.mv_into(z,ws.Xp);
+            if (!ws.Xp.allFinite()) { breakdown=true; return; }
+            double curvature=(w.array()*ws.Xp.array().square()).sum();
+            if (o.ridge>0.) curvature+=o.ridge*z.tail(z.size()-X.unpenalized).squaredNorm();
+            double alpha=curvature>0. ? r.dot(z)/curvature : 1.;
+            alpha=std::isfinite(alpha) ? std::clamp(alpha,1e-10,10.) : 1e-10;
+            ws.mm_old=delta; ws.mm_Xold=Xdelta;
+            delta=ws.mm_y+alpha*z;
+            Xdelta=ws.mm_Xy+alpha*ws.Xp;
+            ++info.inner_iterations;
+            if (!delta.allFinite() || !Xdelta.allFinite()) { breakdown=true; return; }
+            double next=.5*(1.+std::sqrt(1.+4.*momentum*momentum));
+            double theta=(momentum-1.)/next;
+            ws.mm_y=delta+theta*(delta-ws.mm_old);
+            ws.mm_Xy=Xdelta+theta*(Xdelta-ws.mm_Xold);
+            if (!ws.mm_y.allFinite() || !ws.mm_Xy.allFinite()) { breakdown=true; return; }
+            // r = -(g + H*y); the cached X*y avoids another design product.
+            ws.weighted.array()=w.array()*ws.mm_Xy.array();
+            X.tmv_into(ws.weighted,Hp);
+            Hp.tail(z.size()-X.unpenalized)+=o.ridge*ws.mm_y.tail(z.size()-X.unpenalized);
+            r=-g-Hp;
+            momentum=next;
+        }
+        // At the iteration limit validate the gradient at the returned step.
+        ws.weighted.array()=w.array()*Xdelta.array();
+        X.tmv_into(ws.weighted,Hp);
+        Hp.tail(delta.size()-X.unpenalized)+=o.ridge*delta.tail(delta.size()-X.unpenalized);
+        r=-g-Hp;
+        breakdown=!r.allFinite();
+        return;
+    }
     for (int64_t i=0;i<o.inner_maxiter;++i) {
         X.mv_into(p,ws.Xp);
         ws.weighted.array()=w.array()*ws.Xp.array();
@@ -315,7 +393,7 @@ void pcg(const Design& X, const Vec& w, const Vec& g, const Spectrum& s,
 
 void fit(const smm_matrix& input, const double *yp, const double *beta0,
          const smm_options& options, double *out, smm_info& info, const smm_krylov_options *krylov, const smm_stop_options *stop,
-         smm_trace_entry *trace, int64_t trace_capacity, int64_t *trace_size, const smm_family_options *family, bool intercept, bool penalize_intercept, smm_trace_detail *detail) {
+         smm_trace_entry *trace, int64_t trace_capacity, int64_t *trace_size, const smm_family_options *family, bool intercept, bool penalize_intercept, smm_trace_detail *detail, double *likelihood, double dispersion, double *objective) {
     ModelOptions o(options,family);
     SMM_RESET();
     SMM_SCOPE(0);
@@ -370,7 +448,7 @@ void fit(const smm_matrix& input, const double *yp, const double *beta0,
         spec.resize(input.n,p,rank+1);
         spectralws=std::make_unique<SpectralWorkspace>(input.n,p,rank,o);
     }
-    PCGWorkspace pcgws(spectral_mode ? input.n : 0,spectral_mode ? p : 0,spectral_mode ? rank : 0);
+    PCGWorkspace pcgws(spectral_mode ? input.n : 0,spectral_mode ? p : 0,spectral_mode ? rank : 0,krylov && krylov->solver==6);
     std::unique_ptr<KrylovWorkspace> krylovws;
     if (!spectral_mode && !cholesky_mode) krylovws=std::make_unique<KrylovWorkspace>(X,o.ridge,krylov->solver);
     Vec eval(p),ee(input.n),step(p),dEta(input.n),trial(p),trialEta(input.n);
@@ -385,6 +463,8 @@ void fit(const smm_matrix& input, const double *yp, const double *beta0,
         int64_t slot=*trace_size;
         if (slot && (trace ? trace[slot-1].iteration : detail[slot-1].iteration)==info.iterations) --slot;
         else ++*trace_size;
+        if (likelihood) likelihood[slot]=display_loglik(eta,y,o,p,dispersion);
+        if (objective) { auto unpenalized=o; unpenalized.ridge=0.; objective[slot]=loss(eta,y,b,unpenalized); }
         if (trace) trace[slot]={info.iterations,info.inner_iterations,info.restarts,info.corrections,
                                f,g.norm(),g.norm()/scale};
         if (detail) detail[slot]={info.iterations,info.inner_iterations,info.restarts,info.corrections,

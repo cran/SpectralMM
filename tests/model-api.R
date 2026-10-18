@@ -1,5 +1,5 @@
 library(SpectralMM)
-fixture<-if(file.exists('data.csv')) 'data.csv' else 'examples/data.csv'
+fixture<-if(file.exists('data.csv')) 'data.csv' else if(file.exists('tests/data.csv')) 'tests/data.csv' else 'R/tests/data.csv'
 d<-read.csv(fixture); X<-as.matrix(d[c('x1','x2','x3')])
 cases<-c('gaussian','bernoulli','probit','poisson','gamma','negative_binomial')
 families<-list(gaussian(),binomial('logit'),binomial('probit'),poisson(),Gamma('log'),'negative_binomial')

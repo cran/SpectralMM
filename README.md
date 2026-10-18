@@ -1,20 +1,21 @@
-# SpectralMM
+# SpectralMM for R
 
-Spectral majorization for statistical estimation.
-
-This is an independently installable R source package. It contains the R
-interface and a source snapshot of the shared C++ core. No Julia or Python
-installation is required. Rcpp and RcppEigen must be installed; source builds
-require a C++17 compiler. R compiles the core during installation.
+Fit generalized linear models and robust or asymmetric regression with the shared
+SpectralMM C++ core. Requires R 4.0 or later and a C++17 compiler for source installation.
 
 ```r
-install.packages(c("Rcpp", "RcppEigen"))
-# Install this source directory with R CMD INSTALL .
+install.packages("remotes")
+remotes::install_github("Xunjian-Li/SpectralMM", subdir="R")
 library(SpectralMM)
-fit <- spectralmm_glm(X, y, family = binomial("logit"))
-formula_fit <- spectralmm_glm(y ~ x1 + x2, data = dat, family = binomial("logit"))
-summary(fit)
+model <- spectralmm_glm(mpg ~ wt + hp, data=mtcars, family=gaussian())
+summary(model)
+predict(model, newdata=mtcars[1:5, ])
 ```
 
-Use help(package="SpectralMM") for the function reference. This directory is
-generated; edit the canonical repository sources and regenerate it.
+For a local checkout, use `remotes::install_local("R")` from the repository root,
+or install Rcpp and RcppEigen and run `R CMD INSTALL R` in a terminal.
+Edit R code in `R/` and help files in `man/`. Shared C++ files in `src/native/`
+are synchronized from the repository's root `cpp/src/native/` directory.
+
+See `help(package="SpectralMM")` and the
+[full documentation](https://xunjian-li.github.io/SpectralMM/).
